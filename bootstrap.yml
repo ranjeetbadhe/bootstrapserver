@@ -1,0 +1,154 @@
+# This play book is written for deploying RHACM
+#It will create bootstrap server
+#Contact Ranjeet Badhe for support www.ranjeetbadhe.com
+---
+- name: Deploy Bootstrap Server for OpenShift
+  hosts: bootstrap
+  become: yes
+  vars:
+    # General network settings
+    subnet: "192.168.200.0"
+    netmask: "255.255.255.0"
+    gateway: "192.168.200.1"
+    dhcp_range_start: "192.168.200.50"
+    dhcp_range_end: "192.168.200.100"
+    tftp_root: "/var/lib/tftpboot"
+    http_root: "/var/www/html"
+    pxelinux_file: "pxelinux.0"
+    api_vip: "192.168.200.20"
+    ingress_vip: "192.168.200.21"
+
+    # Authentication for RHCOS download
+    rhcos_username: "your_username"
+    rhcos_password: "your_password"
+
+  tasks:
+    - name: Install required packages
+      yum:
+        name:
+          - dnsmasq
+          - httpd
+          - tftp-server
+          - syslinux
+          - net-tools
+          - wget
+        state: present
+
+    - name: Enable and start services
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      with_items:
+        - dnsmasq
+        - httpd
+        - tftp.socket
+
+    - name: Configure dnsmasq
+      copy:
+        dest: /etc/dnsmasq.conf
+        content: |
+          # dnsmasq configuration
+          interface=eth0
+          bind-interfaces
+          domain-needed
+          bogus-priv
+          dhcp-range={{ dhcp_range_start }},{{ dhcp_range_end }},12h
+          dhcp-option=3,{{ gateway }}
+          dhcp-option=6,8.8.8.8
+          dhcp-option=66,"192.168.200.10"  # TFTP server IP address
+          enable-tftp
+          tftp-root={{ tftp_root }}
+          dhcp-boot={{ pxelinux_file }}
+      notify:
+        - Restart dnsmasq
+
+    - name: Create TFTP root directory
+      file:
+        path: "{{ tftp_root }}"
+        state: directory
+        mode: '0755'
+
+    - name: Copy PXE bootloader files
+      copy:
+        src: "/usr/share/syslinux/{{ item }}"
+        dest: "{{ tftp_root }}/"
+        remote_src: yes
+      with_items:
+        - pxelinux.0
+        - ldlinux.c32
+
+    - name: Create PXE default configuration
+      copy:
+        dest: "{{ tftp_root }}/pxelinux.cfg/default"
+        content: |
+          DEFAULT linux
+          LABEL linux
+          KERNEL vmlinuz
+          APPEND initrd=initrd.img ip=dhcp console=tty0 console=ttyS1,115200n8 coreos.inst.install_dev=/dev/sda coreos.inst.image_url=http://{{ ansible_default_ipv4.address }}/images/rhcos-live.x86_64.iso
+      notify:
+        - Restart tftp
+
+    - name: Create HTTP root directory
+      file:
+        path: "{{ http_root }}/images"
+        state: directory
+        mode: '0755'
+
+    - name: Download RHCOS image
+      get_url:
+        url: https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.11/latest/rhcos-live.x86_64.iso
+        dest: "{{ http_root }}/images/rhcos-live.x86_64.iso"
+        headers:
+          Authorization: "Basic {{ (rhcos_username + ':' + rhcos_password) | b64encode }}"
+
+    - name: Configure firewall
+      firewalld:
+        service: "{{ item }}"
+        permanent: yes
+        state: enabled
+      with_items:
+        - dhcp
+        - http
+        - tftp
+      notify:
+        - Reload firewall
+
+    - name: Enable IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 1
+        state: present
+        reload: yes
+
+    - name: Add masquerade to firewalld
+      firewalld:
+        masquerade: yes
+        permanent: yes
+        state: enabled
+      notify:
+        - Reload firewall
+
+    - name: Configure IP forwarding in firewalld
+      firewalld:
+        rich_rule: 'rule family="ipv4" forward accept'
+        permanent: yes
+        state: enabled
+      notify:
+        - Reload firewall
+
+  handlers:
+    - name: Restart dnsmasq
+      service:
+        name: dnsmasq
+        state: restarted
+
+    - name: Restart tftp
+      service:
+        name: tftp.socket
+        state: restarted
+
+    - name: Reload firewall
+      service:
+        name: firewalld
+        state: reloaded
